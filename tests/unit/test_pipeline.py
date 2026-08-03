@@ -179,3 +179,31 @@ class TestStopHookDecision:
         decision = stop_hook_decision(tmp_path / ".argus")
         assert decision["decision"] == "block"
         assert "missing ledger" in decision["reason"]
+
+
+class TestManifestMigration:
+    def test_added_contract_field_with_default_is_not_drift(
+        self, paper_package: Path, tmp_path: Path
+    ):
+        """A run recorded before a contract field existed must stay resumable."""
+        adapter = FakeStageAdapter()
+        config = _config(paper_package, tmp_path, adapter)
+        run_pipeline(config, stop_after="diverged")
+        manifest_path = tmp_path / "out" / "run-manifest.json"
+        recorded = json.loads(manifest_path.read_text())
+        del recorded["input_contract"]["paragraph_merge_chars"]
+        manifest_path.write_text(json.dumps(recorded, indent=2, sort_keys=True))
+        completion = run_pipeline(config)
+        assert completion.complete
+
+    def test_changed_recorded_value_is_still_drift(self, paper_package: Path, tmp_path: Path):
+        adapter = FakeStageAdapter()
+        config = _config(paper_package, tmp_path, adapter)
+        run_pipeline(config, stop_after="diverged")
+        manifest_path = tmp_path / "out" / "run-manifest.json"
+        recorded = json.loads(manifest_path.read_text())
+        recorded["input_contract"]["main_page_count"] = 9
+        manifest_path.write_text(json.dumps(recorded, indent=2, sort_keys=True))
+        with pytest.raises(ArgusError) as excinfo:
+            run_pipeline(config)
+        assert "drifted" in str(excinfo.value)

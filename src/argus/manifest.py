@@ -64,6 +64,23 @@ def write_manifest(output_root: Path, manifest: dict[str, Any]) -> Path:
     return path
 
 
+def _recorded_subset_matches(recorded: Any, current: Any) -> bool:
+    """True when every recorded value still holds in the current config.
+
+    Dicts compare recorded keys only: a field added by a newer argus with a
+    default (schema migration) is not drift, but any recorded value that
+    changed or disappeared is. Non-dicts compare by equality.
+    """
+    if isinstance(recorded, dict):
+        if not isinstance(current, dict):
+            return False
+        return all(
+            key in current and _recorded_subset_matches(value, current[key])
+            for key, value in recorded.items()
+        )
+    return bool(recorded == current)
+
+
 def verify_manifest(output_root: Path, manifest: dict[str, Any]) -> None:
     """Refuse to resume a run whose frozen configuration has drifted.
 
@@ -86,7 +103,7 @@ def verify_manifest(output_root: Path, manifest: dict[str, Any]) -> None:
     drift = {
         key: {"recorded": recorded.get(key), "current": manifest.get(key)}
         for key in frozen_keys
-        if recorded.get(key) != manifest.get(key)
+        if not _recorded_subset_matches(recorded.get(key), manifest.get(key))
     }
     if drift:
         raise ArgusError(
