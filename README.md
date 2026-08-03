@@ -30,9 +30,33 @@ check three claims that review pipelines usually leave unverified:
 
 ## Quick start
 
-```bash
-uv sync
+Open an agent session inside the repo and ask for a review. The repo carries
+its own integration for both Codex and Claude Code, discovered automatically
+when a session starts here:
 
+```bash
+cd argus
+uv sync     # once — the integration wrappers use this venv
+codex       # or: claude
+```
+
+Then just ask:
+
+> review the paper package at path/to/package
+
+A package is a directory with `main.pdf` (4 pages by default; any length via
+`--pages`), `appendix.pdf` or `appendix.md`, and `reference-notes.md`.
+
+The session picks up four things: an `argus` MCP server (live ledger status,
+attrition, concern claiming), a Stop hook that blocks the session while a
+review is incomplete, a skill that teaches the agent the workflow, and
+always-loaded instructions (`AGENTS.md` / `CLAUDE.md`). The agent runs the
+pipeline, watches it, and may only declare success after the MCP completion
+check passes.
+
+### CLI, if you'd rather drive it yourself
+
+```bash
 # one model for every stage
 uv run argus review path/to/package -o runs/paper1 -m anthropic:claude-sonnet-5
 
@@ -50,20 +74,8 @@ uv run argus recall-eval public-issues.json -m anthropic:claude-sonnet-5
 
 Models are named `PROVIDER:MODEL` and can differ per stage
 (`--diverge-model`, `--resolve-model`, `--audit-model`, `--compose-model`).
-
-### Or drive it from a Codex session
-
-The repo carries its own Codex integration, discovered only when a session
-starts inside it: an `argus` MCP server (live ledger status, attrition,
-concern claiming), a Stop hook that blocks the session while a review is
-incomplete, and an `argus-reviewer` skill that teaches the agent the
-commands above.
-
-```bash
-cd argus
-uv sync     # once; the wrappers in bin/ use this venv
-codex       # then ask: "please review this paper"
-```
+Interrupted runs resume with the exact same command; finished work is never
+re-billed.
 
 | Provider prefix | Backends | Isolation tier |
 |---|---|---|
