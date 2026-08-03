@@ -207,3 +207,43 @@ class TestManifestMigration:
         with pytest.raises(ArgusError) as excinfo:
             run_pipeline(config)
         assert "drifted" in str(excinfo.value)
+
+
+class TestEffectiveWorkers:
+    def test_explicit_request_is_respected_and_clamped_to_pending(self):
+        from argus.pipeline import effective_workers
+
+        assert effective_workers("codex-cli", 100, 12) == 12
+        assert effective_workers("codex-cli", 5, 12) == 5
+
+    def test_auto_caps_cli_providers_lower_than_api(self, monkeypatch):
+        import argus.pipeline as pipeline
+
+        monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 32)
+        assert pipeline.effective_workers("codex-cli", 100, None) == 8
+        assert pipeline.effective_workers("openai-compat", 100, None) == 16
+
+    def test_auto_respects_cpu_budget(self, monkeypatch):
+        import argus.pipeline as pipeline
+
+        monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 6)
+        assert pipeline.effective_workers("openai-compat", 100, None) == 4
+
+    def test_pending_count_bounds_auto(self):
+        from argus.pipeline import effective_workers
+
+        assert effective_workers("openai-compat", 3, None) == 3
+        assert effective_workers("openai-compat", 0, None) == 1
+
+    def test_worker_choice_is_recorded_in_ledger(self, paper_package: Path, tmp_path: Path):
+        adapter = FakeStageAdapter()
+        config = _config(paper_package, tmp_path, adapter)
+        run_pipeline(config)
+        from argus.ledger import Ledger
+
+        ledger = Ledger(tmp_path / "out" / "ledger.sqlite3")
+        events = ledger.rows(
+            "SELECT details FROM events WHERE event = 'workers_selected' ORDER BY sequence"
+        )
+        stages = [json.loads(event["details"])["stage"] for event in events]
+        assert "diverge" in stages and "resolve" in stages

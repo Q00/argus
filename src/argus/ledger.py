@@ -194,6 +194,11 @@ class Ledger:
             ),
         )
 
+    def note(self, run_id: str, event: str, details: dict[str, Any] | None = None) -> None:
+        """Append a run-scoped event outside any other transaction."""
+        with self.connect() as db:
+            self.event(db, run_id, "run", run_id, event, details)
+
     # -- runs -------------------------------------------------------------
 
     def create_run(self, run_id: str, package_path: Path, output_path: Path) -> None:

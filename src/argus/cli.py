@@ -88,8 +88,11 @@ def review(
     ] = 1200,
     policy: Annotated[str, typer.Option(help="Domain policy prompt stem")] = "policy-icml",
     workers: Annotated[
-        int, typer.Option(help="Parallel workers for divergence and resolution")
-    ] = 4,
+        int | None,
+        typer.Option(
+            help="Parallel workers for divergence and resolution; omit for auto (pending work, CPU, provider cost)"
+        ),
+    ] = None,
     batch_size: Annotated[int, typer.Option(help="Concerns per resolver call")] = 32,
     stop_after: Annotated[
         str | None, typer.Option(help="Stop after stage: extracted|diverged|resolved")

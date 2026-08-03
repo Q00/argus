@@ -49,6 +49,27 @@ ARGUS_VERSION = "0.1.0"
 
 STAGE_NAMES = ("diverge", "resolve", "audit", "compose")
 
+# Worker ceilings by adapter cost profile: a CLI provider spawns a whole
+# agent process per call, an API provider is a single HTTP request.
+CLI_PROVIDER_WORKER_CAP = 8
+API_PROVIDER_WORKER_CAP = 16
+
+
+def effective_workers(provider: str, pending: int, requested: int | None) -> int:
+    """Pick a worker count from pending work, CPU budget, and provider cost.
+
+    An explicit request is respected (clamped to the pending count); auto
+    mode takes min(provider cap, cpu-2, pending). Work is network-bound, so
+    the CPU term only keeps process spawn overhead reasonable.
+    """
+    if pending <= 0:
+        return 1
+    if requested is not None:
+        return max(1, min(requested, pending))
+    cap = CLI_PROVIDER_WORKER_CAP if provider.endswith("-cli") else API_PROVIDER_WORKER_CAP
+    cpu = os.cpu_count() or 4
+    return max(1, min(cap, max(2, cpu - 2), pending))
+
 
 def default_stage_models(spec: ModelSpec) -> dict[str, ModelSpec]:
     """One spec for every stage; callers can mix providers per stage."""
@@ -65,7 +86,8 @@ class PipelineConfig:
         contract: Input contract; recorded in the run manifest.
         policy: Domain policy prompt stem (e.g. ``policy-icml``).
         state_root: Directory for the active-run pointer and lock.
-        max_workers: Divergence/resolution parallelism.
+        max_workers: Divergence/resolution parallelism; None picks a count
+            per stage from pending work, CPU budget, and provider cost.
         batch_size: Concerns per resolver call.
     """
 
@@ -77,7 +99,7 @@ class PipelineConfig:
         contract: InputContract | None = None,
         policy: str = "policy-icml",
         state_root: Path | None = None,
-        max_workers: int = 4,
+        max_workers: int | None = None,
         batch_size: int = 32,
         adapter_factory: Callable[[str], LLMAdapter] = build_adapter,
     ):
@@ -90,7 +112,7 @@ class PipelineConfig:
         self.contract = contract if contract is not None else InputContract()
         self.policy = policy
         self.state_root = Path(state_root) if state_root else Path.cwd() / ".argus"
-        self.max_workers = max(1, max_workers)
+        self.max_workers = None if max_workers is None else max(1, max_workers)
         self.batch_size = max(1, batch_size)
         self.adapter_factory = adapter_factory
 
@@ -301,6 +323,17 @@ def diverge(run_id: str, config: PipelineConfig, ledger: Ledger) -> None:
     ledger.set_stage(run_id, "diverging")
     gateway, spec = config.gateway("diverge", "divergence")
     units = [unit for unit in ledger.list_units(run_id) if unit["status"] != "complete"]
+    workers = effective_workers(spec.provider, len(units), config.max_workers)
+    ledger.note(
+        run_id,
+        "workers_selected",
+        {
+            "stage": "diverge",
+            "workers": workers,
+            "pending": len(units),
+            "requested": config.max_workers,
+        },
+    )
     errors: list[BaseException] = []
     lock = threading.Lock()
 
@@ -311,7 +344,7 @@ def diverge(run_id: str, config: PipelineConfig, ledger: Ledger) -> None:
             with lock:
                 errors.append(exc)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.max_workers) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for future in [pool.submit(execute, unit) for unit in units]:
             future.result()
     if errors:
@@ -391,6 +424,17 @@ def resolve(run_id: str, config: PipelineConfig, ledger: Ledger) -> None:
                 terminal_stage="resolve",
             )
 
+    workers = effective_workers(spec.provider, len(batches), config.max_workers)
+    ledger.note(
+        run_id,
+        "workers_selected",
+        {
+            "stage": "resolve",
+            "workers": workers,
+            "pending_batches": len(batches),
+            "requested": config.max_workers,
+        },
+    )
     errors: list[BaseException] = []
     lock = threading.Lock()
 
@@ -401,7 +445,7 @@ def resolve(run_id: str, config: PipelineConfig, ledger: Ledger) -> None:
             with lock:
                 errors.append(exc)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.max_workers) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for future in [pool.submit(execute, item) for item in enumerate(batches)]:
             future.result()
     export_ledger(ledger, run_id, config.output_root)
