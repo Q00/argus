@@ -37,17 +37,23 @@ class InputContract:
         main_page_count: Exact page count for main.pdf, or None to accept any.
         min_text_chars: Minimum extractable characters in main.pdf.
         min_ascii_letter_ratio: English-text heuristic threshold.
+        paragraph_merge_chars: Merge adjacent text blocks into paragraph
+            units up to roughly this many characters; 0 keeps one unit per
+            PDF block. Two-column PDFs shatter paragraphs into many small
+            blocks, and one model call per fragment is the dominant cost.
     """
 
     main_page_count: int | None = 4
     min_text_chars: int = 500
     min_ascii_letter_ratio: float = 0.85
+    paragraph_merge_chars: int = 1200
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "main_page_count": self.main_page_count,
             "min_text_chars": self.min_text_chars,
             "min_ascii_letter_ratio": self.min_ascii_letter_ratio,
+            "paragraph_merge_chars": self.paragraph_merge_chars,
         }
 
 
@@ -254,29 +260,74 @@ def _register_unit(
     }
 
 
+# Bibliography detection. Entries after a References/Bibliography heading
+# become corpus evidence for the resolver instead of divergence units — a
+# worker interrogating "Author, A. (2024)." can only answer not-applicable,
+# at one model call per entry. A caption or an Appendix heading resumes
+# normal unit extraction.
+_REFERENCES_HEADING_RE = re.compile(
+    r"^\s*\d{0,3}\.?\s*(references|bibliography)\b[\s\d.]*$", re.IGNORECASE
+)
+_APPENDIX_HEADING_RE = re.compile(r"^\s*(?:[a-z]\s*[.:]?\s+)?appendi(?:x|ces)\b", re.IGNORECASE)
+
+
 def extract_pdf_units(
     pdf_path: Path,
     source_document: str,
     run_id: str,
     units_root: Path,
     start_ordinal: int,
-) -> tuple[list[dict[str, Any]], int, str]:
-    """Extract paragraph/figure/table units from one PDF."""
+    merge_chars: int = 1200,
+) -> tuple[list[dict[str, Any]], int, str, str]:
+    """Extract paragraph/figure/table units from one PDF.
+
+    Returns (units, next_ordinal, full_text, bibliography_text). Adjacent
+    prose blocks are merged into paragraph units of up to ``merge_chars``
+    characters; bibliography blocks are collected instead of registered.
+    """
     document = fitz.open(pdf_path)
     units: list[dict[str, Any]] = []
     full_text: list[str] = []
+    bibliography: list[str] = []
+    in_references = False
     ordinal = start_ordinal
+    pending: list[str] = []
+    pending_page = 0
+
+    def flush_pending() -> None:
+        nonlocal ordinal, pending
+        if not pending:
+            return
+        content = "\n\n".join(pending)
+        locator = f"{source_document} p.{pending_page} paragraph {ordinal + 1}"
+        units.append(
+            _register_unit(
+                units_root,
+                run_id,
+                "paragraph",
+                source_document,
+                pending_page,
+                ordinal,
+                locator,
+                content,
+            )
+        )
+        ordinal += 1
+        pending = []
+
     try:
         for page_index, page in enumerate(document):
             blocks = _text_blocks(page)
             block_index = 0
+            page_number = page_index + 1
             while block_index < len(blocks):
                 block = blocks[block_index]
                 text = block["text"]
                 rect = block["rect"]
-                page_number = page_index + 1
                 caption_match = _caption_match(text)
                 if caption_match:
+                    flush_pending()
+                    in_references = False  # a Figure/Table means prose resumed
                     while block_index + 1 < len(blocks) and _caption_continuation(
                         block, blocks[block_index + 1]
                     ):
@@ -316,27 +367,40 @@ def extract_pdf_units(
                     block_index += 1
                     continue
                 full_text.append(text)
+                if _REFERENCES_HEADING_RE.match(text) and len(text) < 40:
+                    flush_pending()
+                    in_references = True
+                    block_index += 1
+                    continue
+                if in_references and _APPENDIX_HEADING_RE.match(text) and len(text) < 60:
+                    in_references = False
+                    block_index += 1
+                    continue
+                if in_references:
+                    bibliography.append(text)
+                    block_index += 1
+                    continue
                 if len(text) < 18:
                     block_index += 1
                     continue
-                locator = f"{source_document} p.{page_number} paragraph {ordinal + 1}"
-                units.append(
-                    _register_unit(
-                        units_root,
-                        run_id,
-                        "paragraph",
-                        source_document,
-                        page_number,
-                        ordinal,
-                        locator,
-                        text,
-                    )
-                )
-                ordinal += 1
+                if merge_chars <= 0:
+                    flush_pending()
+                    pending.append(text)
+                    pending_page = page_number
+                    flush_pending()
+                elif pending and sum(len(part) for part in pending) + len(text) > merge_chars:
+                    flush_pending()
+                    pending.append(text)
+                    pending_page = page_number
+                else:
+                    if not pending:
+                        pending_page = page_number
+                    pending.append(text)
                 block_index += 1
+            flush_pending()
     finally:
         document.close()
-    return units, ordinal, "\n\n".join(full_text)
+    return units, ordinal, "\n\n".join(full_text), "\n\n".join(bibliography)
 
 
 def extract_package(
@@ -345,7 +409,14 @@ def extract_package(
     """Build all units and the full-context corpus for one run."""
     units_root = output_root / "units"
     units_root.mkdir(parents=True, exist_ok=True)
-    units, _, main_text = extract_pdf_units(package.main_pdf, "main", run_id, units_root, 0)
+    units, _, main_text, bibliography = extract_pdf_units(
+        package.main_pdf,
+        "main",
+        run_id,
+        units_root,
+        0,
+        merge_chars=contract.paragraph_merge_chars,
+    )
     if package.appendix.suffix.lower() == ".pdf":
         appendix_document = fitz.open(package.appendix)
         try:
@@ -356,6 +427,7 @@ def extract_package(
         appendix_text = package.appendix.read_text(encoding="utf-8")
     corpus = {
         "main_text": main_text,
+        "main_bibliography": bibliography,
         "appendix_text": appendix_text,
         "reference_notes": package.reference_notes.read_text(encoding="utf-8"),
         "package_files": {
@@ -365,7 +437,10 @@ def extract_package(
         },
         "input_contract": contract.as_dict(),
         "unit_count": len(units),
-        "divergence_scope": "Every extractable prose block, Figure, Table, and caption in main.pdf.",
+        "divergence_scope": (
+            "Every extractable body prose block, Figure, Table, and caption in main.pdf. "
+            "Detected bibliography blocks are corpus evidence, not divergence units."
+        ),
         "appendix_role": "Full-context convergence evidence; not a source of divergence units.",
     }
     _write_json(output_root / "corpus.json", corpus)

@@ -401,7 +401,7 @@ def resolve(run_id: str, config: PipelineConfig, ledger: Ledger) -> None:
             with lock:
                 errors.append(exc)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, config.max_workers)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config.max_workers) as pool:
         for future in [pool.submit(execute, item) for item in enumerate(batches)]:
             future.result()
     export_ledger(ledger, run_id, config.output_root)

@@ -80,8 +80,16 @@ def review(
             help="Exact main.pdf page count; omit flag for the default (4), pass 0 for any"
         ),
     ] = None,
+    merge_chars: Annotated[
+        int,
+        typer.Option(
+            help="Merge adjacent text blocks into paragraph units up to this many characters; 0 keeps one unit per PDF block"
+        ),
+    ] = 1200,
     policy: Annotated[str, typer.Option(help="Domain policy prompt stem")] = "policy-icml",
-    workers: Annotated[int, typer.Option(help="Parallel divergence workers")] = 4,
+    workers: Annotated[
+        int, typer.Option(help="Parallel workers for divergence and resolution")
+    ] = 4,
     batch_size: Annotated[int, typer.Option(help="Concerns per resolver call")] = 32,
     stop_after: Annotated[
         str | None, typer.Option(help="Stop after stage: extracted|diverged|resolved")
@@ -99,9 +107,12 @@ def review(
         if override is not None:
             stage_models[stage] = _apply_endpoint(parse_model(override), base_url, api_key_env)
     if pages is None:
-        contract = InputContract()
+        contract = InputContract(paragraph_merge_chars=merge_chars)
     else:
-        contract = InputContract(main_page_count=None if pages == 0 else pages)
+        contract = InputContract(
+            main_page_count=None if pages == 0 else pages,
+            paragraph_merge_chars=merge_chars,
+        )
     config = PipelineConfig(
         package_root=package,
         output_root=output,

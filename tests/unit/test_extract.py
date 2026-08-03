@@ -67,3 +67,95 @@ class TestExtractPackage:
         assert corpus["input_contract"]["main_page_count"] == 1
         assert "main.pdf" in corpus["package_files"]
         assert "distillation" in corpus["main_text"]
+
+
+def _pdf_with_references(tmp_path: Path) -> Path:
+    """One-page package: body paragraph, References section, appendix resume."""
+    import fitz
+
+    package = tmp_path / "ref-package"
+    package.mkdir()
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_textbox(
+        fitz.Rect(60, 60, 540, 140),
+        "We evaluate the proposed method on three benchmarks. Accuracy improves by 3.5 points.",
+        fontsize=11,
+    )
+    page.insert_textbox(fitz.Rect(60, 160, 540, 190), "References", fontsize=12)
+    page.insert_textbox(
+        fitz.Rect(60, 200, 540, 260),
+        "Ada Lovelace and Alan Turing. On computable numbers. Annals of Mathematics, 1936.",
+        fontsize=9,
+    )
+    page.insert_textbox(
+        fitz.Rect(60, 270, 540, 330),
+        "Grace Hopper. The education of a computer. Proceedings of the ACM, 1952.",
+        fontsize=9,
+    )
+    page.insert_textbox(fitz.Rect(60, 350, 540, 380), "Appendix A. Proofs", fontsize=12)
+    page.insert_textbox(
+        fitz.Rect(60, 390, 540, 460),
+        "The full proof of the convergence theorem follows from the bounded gradient assumption.",
+        fontsize=11,
+    )
+    document.save(package / "main.pdf")
+    document.close()
+    (package / "appendix.md").write_text("## Appendix\n\nExtra material.\n", encoding="utf-8")
+    (package / "reference-notes.md").write_text("- Notes.\n", encoding="utf-8")
+    return package
+
+
+class TestReferencesFilter:
+    def test_bibliography_blocks_become_corpus_not_units(self, tmp_path: Path):
+        package_root = _pdf_with_references(tmp_path)
+        contract = InputContract(main_page_count=1, min_text_chars=100)
+        package = validate_package(package_root, contract)
+        result = extract_package(package, "run_1", tmp_path / "out", contract)
+        unit_texts = [Path(unit["content_path"]).read_text() for unit in result["units"]]
+        assert not any("Lovelace" in text for text in unit_texts)
+        assert "Lovelace" in result["corpus"]["main_bibliography"]
+        assert "Hopper" in result["corpus"]["main_bibliography"]
+
+    def test_appendix_heading_resumes_unit_extraction(self, tmp_path: Path):
+        package_root = _pdf_with_references(tmp_path)
+        contract = InputContract(main_page_count=1, min_text_chars=100)
+        package = validate_package(package_root, contract)
+        result = extract_package(package, "run_1", tmp_path / "out", contract)
+        unit_texts = [Path(unit["content_path"]).read_text() for unit in result["units"]]
+        assert any("convergence theorem" in text for text in unit_texts)
+
+    def test_bibliography_stays_out_of_divergence_but_reaches_resolver_corpus(self, tmp_path: Path):
+        package_root = _pdf_with_references(tmp_path)
+        contract = InputContract(main_page_count=1, min_text_chars=100)
+        package = validate_package(package_root, contract)
+        result = extract_package(package, "run_1", tmp_path / "out", contract)
+        corpus = json.loads((tmp_path / "out" / "corpus.json").read_text())
+        assert corpus["main_bibliography"] == result["corpus"]["main_bibliography"]
+        assert "bibliography" in corpus["divergence_scope"].lower()
+
+
+class TestParagraphMerging:
+    def test_adjacent_blocks_merge_up_to_target(self, paper_package: Path, tmp_path: Path):
+        contract = InputContract(main_page_count=1, min_text_chars=100, paragraph_merge_chars=1200)
+        package = validate_package(paper_package, contract)
+        result = extract_package(package, "run_1", tmp_path / "out", contract)
+        paragraphs = [unit for unit in result["units"] if unit["kind"] == "paragraph"]
+        # The fixture's two ~230-char paragraphs fit one merged unit.
+        assert len(paragraphs) == 1
+        merged = Path(paragraphs[0]["content_path"]).read_text()
+        assert "distillation" in merged and "five seeds" in merged
+
+    def test_merge_disabled_keeps_one_unit_per_block(self, paper_package: Path, tmp_path: Path):
+        contract = InputContract(main_page_count=1, min_text_chars=100, paragraph_merge_chars=0)
+        package = validate_package(paper_package, contract)
+        result = extract_package(package, "run_1", tmp_path / "out", contract)
+        paragraphs = [unit for unit in result["units"] if unit["kind"] == "paragraph"]
+        assert len(paragraphs) == 2
+
+    def test_merge_target_is_recorded_in_contract(self, paper_package: Path, tmp_path: Path):
+        contract = InputContract(main_page_count=1, min_text_chars=100, paragraph_merge_chars=800)
+        package = validate_package(paper_package, contract)
+        extract_package(package, "run_1", tmp_path / "out", contract)
+        corpus = json.loads((tmp_path / "out" / "corpus.json").read_text())
+        assert corpus["input_contract"]["paragraph_merge_chars"] == 800
