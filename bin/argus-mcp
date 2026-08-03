@@ -1,0 +1,16 @@
+#!/bin/sh
+# Repo-local MCP launcher for Codex. Runs from the repo root so the server
+# discovers .argus/active.json regardless of where Codex spawned it.
+set -eu
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+PYTHON="$ROOT/.venv/bin/python"
+
+if [ ! -x "$PYTHON" ]; then
+  printf '%s\n' "argus MCP cannot start: missing $PYTHON (run: uv sync)" >&2
+  exit 2
+fi
+
+cd "$ROOT"
+exec "$PYTHON" -m argus.mcp_server

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Codex Stop hook: blocks the session while an argus review is incomplete.
+set -eu
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+PYTHON="$ROOT/.venv/bin/python"
+
+if [ ! -x "$PYTHON" ]; then
+  printf '%s\n' "Review completion cannot be verified: missing $PYTHON (run: uv sync)" >&2
+  exit 2
+fi
+
+cd "$ROOT"
+exec "$PYTHON" -m argus.cli check-completion

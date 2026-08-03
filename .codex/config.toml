@@ -1,0 +1,22 @@
+# Repo-local Codex configuration. Discovered only when a session starts
+# inside this repository; merged with the user's global config, so provider
+# and auth settings are inherited.
+
+[features]
+hooks = true
+
+[mcp_servers.argus]
+command = "/bin/sh"
+args = ["-c", 'exec "$(git rev-parse --show-toplevel)/bin/argus-mcp"']
+enabled = true
+required = true
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/bin/check-completion"'
+timeout = 30
+statusMessage = "Checking review completion"
