@@ -9,3 +9,4 @@ dist/
 .argus/
 runs/
 .env
+inputs/
