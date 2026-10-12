@@ -12,6 +12,16 @@ class TestSplitSentences:
         assert result.sentences[0].startswith("Our method, cf. Fig. 3")
         assert result.sentences[1].startswith("Eq. 2")
 
+    def test_dot_before_closing_brace_does_not_split(self):
+        result = split_sentences("\\paragraph{Scope.} We study two benchmarks. It works.")
+        assert len(result.sentences) == 2
+        assert result.sentences[0].startswith("\\paragraph{Scope.} We study")
+        assert result.lossless
+
+    def test_bang_before_closing_brace_does_not_split(self):
+        result = split_sentences("\\resizebox{\\linewidth}{!}{x} holds. Next one.")
+        assert result.sentences == ("\\resizebox{\\linewidth}{!}{x} holds.", "Next one.")
+
     def test_no_of_pattern_is_protected(self):
         result = split_sentences("No. of parameters is 7B. Training takes two days.")
         assert len(result.sentences) == 2

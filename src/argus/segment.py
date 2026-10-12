@@ -22,7 +22,7 @@ import pysbd
 
 from argus.core import ExtractionError
 
-SEGMENTER_VERSION = f"pysbd-{getattr(pysbd, '__version__', 'unknown')}+argus.2"
+SEGMENTER_VERSION = f"pysbd-{getattr(pysbd, '__version__', 'unknown')}+argus.3"
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -56,19 +56,30 @@ _ABBREVIATION_RES = [
 # "No." only when clearly enumerative ("No. 3", "No. of parameters").
 _NO_RE = re.compile(r"(?<![\w.])No\.(?=\s+(?:\d|of\b))")
 _WRT_RE = re.compile(r"(?<![\w.])w\.r\.t\.(?=\s)")
+# Terminal punctuation directly before a closing brace ends a LaTeX
+# argument, not a sentence: "\paragraph{Scope.} We study" and
+# "\resizebox{\linewidth}{!}{" must not split. "!" and "?" get their own
+# sentinels so restoration stays exact.
+_BRACED_DOT_RE = re.compile(r"\.(?=\})")
+_BRACED_SENTINELS = {"!": "ǃ", "?": "ʔ"}  # LATIN LETTER RETROFLEX CLICK, GLOTTAL STOP
+_BRACED_MARK_RE = re.compile(r"[!?](?=\})")
 
 
 def _protect(text: str) -> str:
-    if _SENTINEL in text:
+    if any(sentinel in text for sentinel in (_SENTINEL, *_BRACED_SENTINELS.values())):
         raise ExtractionError("input text contains the segmentation sentinel character")
     for pattern, replacement in _ABBREVIATION_RES:
         text = pattern.sub(replacement, text)
     text = _NO_RE.sub("No" + _SENTINEL, text)
     text = _WRT_RE.sub(f"w{_SENTINEL}r{_SENTINEL}t{_SENTINEL}", text)
+    text = _BRACED_DOT_RE.sub(_SENTINEL, text)
+    text = _BRACED_MARK_RE.sub(lambda match: _BRACED_SENTINELS[match.group(0)], text)
     return text
 
 
 def _restore(text: str) -> str:
+    for mark, sentinel in _BRACED_SENTINELS.items():
+        text = text.replace(sentinel, mark)
     return text.replace(_SENTINEL, ".")
 
 

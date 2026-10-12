@@ -2,8 +2,10 @@
 
 Turns ``main.pdf`` + ``appendix.(pdf|md)`` + ``reference-notes.md`` into
 paragraph / figure / table units, each staged as a payload directory with a
-hash manifest. Two honesty rules distinguish this from the usual PDF
-pipeline:
+hash manifest. A tex package (root ``.tex`` file + ``reference-notes.md`` +
+optional ``issues.json``) is segmented from its source instead, so each unit
+maps to a source line range and belongs to a section block. Two honesty
+rules distinguish this from the usual PDF pipeline:
 
     * The input contract is an explicit ``InputContract`` value recorded in
       the run manifest — never a silent environment-variable override.
@@ -13,7 +15,7 @@ pipeline:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
@@ -22,6 +24,18 @@ from typing import Any
 import fitz
 
 from argus.core import ExtractionError, sha256_file, stable_id
+from argus.evalx import load_issue_file
+from argus.tex import (
+    TexDocument,
+    TexLayout,
+    bibliography_files,
+    build_cell_catalog,
+    expand_tex,
+    locator,
+    render_image,
+    resolve_image,
+    segment_document,
+)
 
 CAPTION_RE = re.compile(
     r"^\s*(?P<kind>figure|fig\.|table)\s+(?P<label>[A-Za-z0-9]+)\s*[.:]\s+(?P<caption>.+)",
@@ -41,28 +55,48 @@ class InputContract:
             units up to roughly this many characters; 0 keeps one unit per
             PDF block. Two-column PDFs shatter paragraphs into many small
             blocks, and one model call per fragment is the dominant cost.
+        main_tex: Root tex file name; its presence makes the package a tex
+            package. Page count and merge size do not apply to tex packages.
+        source: ``pdf`` or ``tex``, set from the validated package.
     """
 
     main_page_count: int | None = 4
     min_text_chars: int = 500
     min_ascii_letter_ratio: float = 0.85
     paragraph_merge_chars: int = 1200
+    main_tex: str = "main.tex"
+    source: str = "pdf"
 
     def as_dict(self) -> dict[str, Any]:
+        tex = self.source == "tex"
         return {
-            "main_page_count": self.main_page_count,
+            "main_page_count": None if tex else self.main_page_count,
             "min_text_chars": self.min_text_chars,
             "min_ascii_letter_ratio": self.min_ascii_letter_ratio,
-            "paragraph_merge_chars": self.paragraph_merge_chars,
+            "paragraph_merge_chars": None if tex else self.paragraph_merge_chars,
+            "source": self.source,
+            "main_tex": self.main_tex if tex else None,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class Package:
+    """A validated input package.
+
+    Attributes:
+        files: Package-relative path -> file for every input whose hash
+            identifies the run (the PDF mapping is main.pdf, the appendix,
+            and reference-notes.md).
+    """
+
     root: Path
-    main_pdf: Path
-    appendix: Path
+    main_pdf: Path | None
+    appendix: Path | None
     reference_notes: Path
+    source: str = "pdf"
+    main_tex: Path | None = None
+    issues: Path | None = None
+    files: dict[str, Path] = field(default_factory=dict)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -72,11 +106,65 @@ def _write_json(path: Path, value: Any) -> None:
     )
 
 
+def _check_text(extracted: str, contract: InputContract, name: str) -> None:
+    if len(extracted.strip()) < contract.min_text_chars:
+        raise ExtractionError(
+            f"{name} does not contain enough extractable text",
+            {"minimum": contract.min_text_chars, "found": len(extracted.strip())},
+        )
+    ascii_letters = sum(ch.isascii() and ch.isalpha() for ch in extracted)
+    all_letters = sum(ch.isalpha() for ch in extracted)
+    if all_letters and ascii_letters / all_letters < contract.min_ascii_letter_ratio:
+        raise ExtractionError(
+            f"{name} does not appear to be predominantly English",
+            {"ratio": round(ascii_letters / all_letters, 3)},
+        )
+
+
+def _validate_tex_package(root: Path, contract: InputContract) -> Package:
+    references = root / "reference-notes.md"
+    if not references.is_file():
+        raise ExtractionError("missing required input", {"missing": ["reference-notes.md"]})
+    document = expand_tex(root, contract.main_tex)
+    layout = segment_document(document)
+    _check_text(document.text[: layout.main_end], contract, contract.main_tex)
+    if not references.read_text(encoding="utf-8").strip():
+        raise ExtractionError("reference-notes.md is empty")
+    files = {relative: root / relative for relative in document.files}
+    for raw in layout.figure_images:
+        relative, path = resolve_image(root, raw)
+        files[relative] = path
+    for name in bibliography_files(document, layout.main_end):
+        if (root / name).is_file():
+            files[name] = root / name
+    files["reference-notes.md"] = references
+    issues = root / "issues.json"
+    if issues.is_file():
+        load_issue_file(issues)
+        files["issues.json"] = issues
+    return Package(
+        root=root,
+        main_pdf=None,
+        appendix=None,
+        reference_notes=references,
+        source="tex",
+        main_tex=root / document.files[0],
+        issues=issues if issues.is_file() else None,
+        files=files,
+    )
+
+
 def validate_package(root: Path | str, contract: InputContract) -> Package:
-    """Validate the package layout and content against the contract."""
+    """Validate the package layout and content against the contract.
+
+    A package holding ``contract.main_tex`` is a tex package; any other
+    package must satisfy the PDF contract.
+    """
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ExtractionError(f"input package is not a directory: {root}")
+    if (root / contract.main_tex).is_file():
+        return _validate_tex_package(root, contract)
     main = root / "main.pdf"
     references = root / "reference-notes.md"
     appendix = next(
@@ -99,23 +187,22 @@ def validate_package(root: Path | str, contract: InputContract) -> Package:
         extracted = "".join(page.get_text() for page in document)
     finally:
         document.close()
-    if len(extracted.strip()) < contract.min_text_chars:
-        raise ExtractionError(
-            "main.pdf does not contain enough extractable text",
-            {"minimum": contract.min_text_chars, "found": len(extracted.strip())},
-        )
-    ascii_letters = sum(ch.isascii() and ch.isalpha() for ch in extracted)
-    all_letters = sum(ch.isalpha() for ch in extracted)
-    if all_letters and ascii_letters / all_letters < contract.min_ascii_letter_ratio:
-        raise ExtractionError(
-            "main.pdf does not appear to be predominantly English",
-            {"ratio": round(ascii_letters / all_letters, 3)},
-        )
+    _check_text(extracted, contract, "main.pdf")
     if not references.read_text(encoding="utf-8").strip():
         raise ExtractionError("reference-notes.md is empty")
     if appendix.suffix == ".pdf" and appendix.read_bytes()[:5] != b"%PDF-":
         raise ExtractionError("appendix.pdf is not a PDF file")
-    return Package(root=root, main_pdf=main, appendix=appendix, reference_notes=references)
+    return Package(
+        root=root,
+        main_pdf=main,
+        appendix=appendix,
+        reference_notes=references,
+        files={
+            "main.pdf": main,
+            appendix.name: appendix,
+            "reference-notes.md": references,
+        },
+    )
 
 
 def _clean_block(text: str) -> str:
@@ -219,6 +306,7 @@ def _register_unit(
     caption: str | None = None,
     image_writer: Any = None,
     crop_evidence: dict[str, float] | None = None,
+    tex_location: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     unit_id = stable_id("unt", run_id, kind, source_document, page_number, ordinal, content)
     unit_root = units_root / unit_id
@@ -242,9 +330,11 @@ def _register_unit(
             "image_sha256": sha256_file(image_path) if image_path else None,
         },
         "crop_evidence": crop_evidence,
+        "tex_location": tex_location,
         "isolation": ("payload: divergence workers receive exactly these files and nothing else"),
     }
     _write_json(unit_root / "manifest.json", manifest)
+    location = tex_location or {}
     return {
         "id": unit_id,
         "run_id": run_id,
@@ -257,6 +347,11 @@ def _register_unit(
         "image_path": str(image_path.resolve()) if image_path else None,
         "caption": caption,
         "manifest_path": str((unit_root / "manifest.json").resolve()),
+        "section_id": location.get("section_id"),
+        "section_title": location.get("section_title"),
+        "tex_file": location.get("tex_file"),
+        "line_start": location.get("line_start"),
+        "line_end": location.get("line_end"),
     }
 
 
@@ -403,10 +498,111 @@ def extract_pdf_units(
     return units, ordinal, "\n\n".join(full_text), "\n\n".join(bibliography)
 
 
+def extract_tex_units(
+    package_root: Path,
+    document: TexDocument,
+    layout: TexLayout,
+    run_id: str,
+    units_root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Register every main-body unit of a segmented tex document.
+
+    Returns (units, sections); sections list each block's id, title,
+    parent title, and unit ids in order.
+    """
+    units: list[dict[str, Any]] = []
+    sections: list[dict[str, Any]] = []
+    for block in layout.blocks:
+        unit_ids: list[str] = []
+        for unit in block.units:
+            image_writer = None
+            if unit.image is not None:
+                _, image = resolve_image(package_root, unit.image)
+                image_writer = lambda target, source=image: render_image(source, target)  # noqa: E731
+            tex_file, line_start = document.origins[unit.first_line]
+            record = _register_unit(
+                units_root,
+                run_id,
+                unit.kind,
+                "main",
+                None,
+                len(units),
+                locator(document, unit.first_line, unit.last_line, block.title),
+                unit.text,
+                caption=unit.caption,
+                image_writer=image_writer,
+                tex_location={
+                    "section_id": block.section_id,
+                    "section_title": block.title,
+                    "tex_file": tex_file,
+                    "line_start": line_start,
+                    "line_end": document.origins[unit.last_line][1],
+                },
+            )
+            units.append(record)
+            unit_ids.append(record["id"])
+        sections.append(
+            {
+                "section_id": block.section_id,
+                "title": block.title,
+                "parent_title": block.parent_title,
+                "unit_ids": unit_ids,
+            }
+        )
+    return units, sections
+
+
+def _extract_tex_package(
+    package: Package, run_id: str, output_root: Path, contract: InputContract
+) -> dict[str, Any]:
+    assert package.main_tex is not None
+    units_root = output_root / "units"
+    units_root.mkdir(parents=True, exist_ok=True)
+    main_tex = package.main_tex.relative_to(package.root).as_posix()
+    document = expand_tex(package.root, main_tex)
+    layout = segment_document(document)
+    units, sections = extract_tex_units(package.root, document, layout, run_id, units_root)
+    tables = build_cell_catalog(document, layout)
+    bibliography = [
+        (package.root / name).read_text(encoding="utf-8")
+        for name in bibliography_files(document, layout.main_end)
+        if (package.root / name).is_file()
+    ]
+    appendix_text = ""
+    if layout.main_end < len(document.text):
+        appendix_text = document.text[layout.main_end :].split("\\appendix", 1)[1].strip()
+    corpus = {
+        "main_text": document.text[: layout.main_end].strip(),
+        "main_bibliography": "\n\n".join(bibliography),
+        "appendix_text": appendix_text,
+        "reference_notes": package.reference_notes.read_text(encoding="utf-8"),
+        "package_files": {name: sha256_file(path) for name, path in package.files.items()},
+        "input_contract": contract.as_dict(),
+        "unit_count": len(units),
+        "divergence_scope": (
+            f"Every paragraph, figure environment, and table environment of the expanded "
+            f"{main_tex} body before \\appendix and the bibliography command. The "
+            f"bibliography and the appendix are corpus evidence, not divergence units."
+        ),
+        "appendix_role": (
+            "Text after \\appendix is full-context convergence evidence; not a source of "
+            "divergence units. Its tables are in the table cell catalog."
+        ),
+    }
+    _write_json(output_root / "corpus.json", corpus)
+    _write_json(output_root / "unit-index.json", units)
+    _write_json(output_root / "sections.json", sections)
+    _write_json(output_root / "table-cells.json", {"tables": tables})
+    return {"units": units, "corpus": corpus, "sections": sections, "tables": tables}
+
+
 def extract_package(
     package: Package, run_id: str, output_root: Path, contract: InputContract
 ) -> dict[str, Any]:
     """Build all units and the full-context corpus for one run."""
+    if package.source == "tex":
+        return _extract_tex_package(package, run_id, output_root, contract)
+    assert package.main_pdf is not None and package.appendix is not None
     units_root = output_root / "units"
     units_root.mkdir(parents=True, exist_ok=True)
     units, _, main_text, bibliography = extract_pdf_units(

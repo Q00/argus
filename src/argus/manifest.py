@@ -2,7 +2,8 @@
 
 The manifest is written at prepare time and re-verified on every resume.
 It pins: input hashes, the input contract, per-stage model specs, prompt
-and policy hashes, the segmenter version, and any environment overrides
+and policy hashes, the segmenter version, the diagnosis options, and any
+environment overrides
 that influence behavior (base URLs — never key values). If any pinned
 value changes mid-run, the pipeline refuses to resume: a run's results are
 attributable to exactly one configuration or the run is invalid.
@@ -21,7 +22,7 @@ from argus.gateway import ModelSpec
 from argus.prompts import prompt_hashes
 from argus.segment import SEGMENTER_VERSION
 
-PROMPT_NAMES = ["divergence", "resolution", "audit", "composition"]
+PROMPT_NAMES = ["divergence", "resolution", "audit", "composition", "outline", "structure"]
 
 # Env vars that change behavior and therefore must be visible in the
 # manifest. API keys are recorded as set/unset only, never by value.
@@ -37,6 +38,7 @@ def build_manifest(
     stage_models: dict[str, ModelSpec],
     policy_name: str,
     argus_version: str,
+    diagnosis: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "run_id": run_id,
@@ -48,6 +50,7 @@ def build_manifest(
         "prompt_sha256": prompt_hashes([*PROMPT_NAMES, policy_name]),
         "policy": policy_name,
         "segmenter_version": SEGMENTER_VERSION,
+        "diagnosis": diagnosis,
         "environment": {
             **{name: os.environ.get(name) for name in BEHAVIOR_ENV_VARS},
             **{name: bool(os.environ.get(name)) for name in SECRET_ENV_VARS},
@@ -99,6 +102,7 @@ def verify_manifest(output_root: Path, manifest: dict[str, Any]) -> None:
         "prompt_sha256",
         "policy",
         "segmenter_version",
+        "diagnosis",
     )
     drift = {
         key: {"recorded": recorded.get(key), "current": manifest.get(key)}

@@ -16,6 +16,14 @@ Quick reference:
 - The Stop hook blocks this session while a review is incomplete; resume the
   review instead of working around the hook.
 - Never edit `runs/**`, `.argus/**`, or the SQLite ledger by hand.
+- A package with a root tex file (`--main-tex`, default `main.tex`) is
+  reviewed from its LaTeX source and also produces `revision-plan.md`. Show
+  the owner that plan, apply only the rows the owner approves, and wait for
+  the owner on every "Decisions needed" item. Follow the skill for the steps.
+- A package with a root tex file (`--main-tex`, default `main.tex`) is
+  reviewed from its LaTeX source and also produces `revision-plan.md`. Show
+  the owner that plan, apply only the rows the owner approves, and wait for
+  the owner on every "Decisions needed" item. Follow the skill for the steps.
 
 Development checks: `uv run pytest`, `uv run ruff check src tests`,
 `uv run mypy src`. All tests run offline via fake adapters.

@@ -19,7 +19,7 @@ from argus.core import ArgusError, stable_id
 from argus.ledger import TERMINAL_CONCERN_STATES, Ledger
 from argus.pipeline import read_active_pointer
 
-SERVER_INFO = {"name": "argus-review-checklist", "version": "0.1.0"}
+SERVER_INFO = {"name": "argus-review-checklist", "version": "0.2.0"}
 PROTOCOL_VERSION = "2025-06-18"
 
 TOOLS = [
@@ -79,7 +79,10 @@ TOOLS = [
     },
     {
         "name": "review_verify_completion",
-        "description": "Physically verify that every unit, claim, concern, and final review is complete.",
+        "description": (
+            "Physically verify that every unit, claim, concern, section diagnosis, final review, "
+            "and (for tex packages) revision plan is complete."
+        ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 ]

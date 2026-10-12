@@ -58,7 +58,10 @@ def _apply_endpoint(spec: ModelSpec, base_url: str | None, api_key_env: str | No
 def review(
     package: Annotated[
         Path,
-        typer.Argument(help="Input package directory (main.pdf, appendix, reference-notes.md)"),
+        typer.Argument(
+            help="Input package directory: main.pdf + appendix + reference-notes.md, or a root "
+            "tex file + reference-notes.md (+ optional issues.json)"
+        ),
     ],
     output: Annotated[Path, typer.Option("--output", "-o", help="Run output directory")],
     model: Annotated[str, typer.Option("--model", "-m", help="PROVIDER:MODEL for all stages")],
@@ -69,6 +72,9 @@ def review(
         str | None, typer.Option(help="Override for the resolve stage")
     ] = None,
     audit_model: Annotated[str | None, typer.Option(help="Override for the audit stage")] = None,
+    diagnose_model: Annotated[
+        str | None, typer.Option(help="Override for the diagnose stage")
+    ] = None,
     compose_model: Annotated[
         str | None, typer.Option(help="Override for the compose stage")
     ] = None,
@@ -86,11 +92,25 @@ def review(
             help="Merge adjacent text blocks into paragraph units up to this many characters; 0 keeps one unit per PDF block"
         ),
     ] = 1200,
+    main_tex: Annotated[
+        str,
+        typer.Option(
+            help="Root tex file; when it exists in the package, the package is reviewed from "
+            "its LaTeX source and --pages/--merge-chars do not apply"
+        ),
+    ] = "main.tex",
+    preserve_wording: Annotated[
+        bool,
+        typer.Option(
+            "--preserve-wording/--no-preserve-wording",
+            help="Diagnosis reports only factual errors in sentences (the wording is final)",
+        ),
+    ] = False,
     policy: Annotated[str, typer.Option(help="Domain policy prompt stem")] = "policy-icml",
     workers: Annotated[
         int | None,
         typer.Option(
-            help="Parallel workers for divergence and resolution; omit for auto (pending work, CPU, provider cost)"
+            help="Parallel workers for divergence, resolution, and diagnosis; omit for auto (pending work, CPU, provider cost)"
         ),
     ] = None,
     batch_size: Annotated[int, typer.Option(help="Concerns per resolver call")] = 32,
@@ -105,16 +125,18 @@ def review(
         ("diverge", diverge_model),
         ("resolve", resolve_model),
         ("audit", audit_model),
+        ("diagnose", diagnose_model),
         ("compose", compose_model),
     ):
         if override is not None:
             stage_models[stage] = _apply_endpoint(parse_model(override), base_url, api_key_env)
     if pages is None:
-        contract = InputContract(paragraph_merge_chars=merge_chars)
+        contract = InputContract(paragraph_merge_chars=merge_chars, main_tex=main_tex)
     else:
         contract = InputContract(
             main_page_count=None if pages == 0 else pages,
             paragraph_merge_chars=merge_chars,
+            main_tex=main_tex,
         )
     config = PipelineConfig(
         package_root=package,
@@ -124,6 +146,7 @@ def review(
         policy=policy,
         max_workers=workers,
         batch_size=batch_size,
+        preserve_wording=preserve_wording,
     )
     try:
         completion = run_pipeline(config, stop_after=stop_after)
@@ -169,7 +192,8 @@ def stop_hook_decision(state_root: Path) -> dict[str, object]:
         "reason": (
             f"Argus review {completion.run_id} is incomplete at stage {completion.stage}: "
             f"{completion.open_units} open units, {completion.uncovered_claims} uncovered claims, "
-            f"{completion.unresolved_concerns} unresolved concerns. "
+            f"{completion.unresolved_concerns} unresolved concerns, "
+            f"{completion.undiagnosed_sections} undiagnosed sections. "
             f"Next action: {completion.next_action}."
         ),
     }

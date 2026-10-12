@@ -12,6 +12,9 @@ Invariants:
     * Duplicate concerns from a divergence worker are demoted to a logged
       ``duplicate_concern_skipped`` event instead of failing the whole unit —
       a model repeating a question is noise to record, not fatal.
+    * Structural diagnosis is recorded per section block in one transaction
+      that ends with a ``section_done`` marker, so a block is either fully
+      diagnosed or absent and resume skips exactly the finished blocks.
 """
 
 from __future__ import annotations
@@ -41,9 +44,15 @@ RUN_STAGES = (
     "diverged",
     "resolving",
     "resolved",
+    "diagnosing",
+    "diagnosed",
     "composing",
     "complete",
 )
+
+OUTLINE_DIAGNOSIS_KINDS = ("item", "pair", "sentence", "concern", "section_done")
+STRUCTURE_DIAGNOSIS_KINDS = ("section", "issue", "structure_done")
+REVISION_PLAN_NAME = "revision-plan.md"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +65,7 @@ class Completion:
     open_units: int
     uncovered_claims: int
     unresolved_concerns: int
+    undiagnosed_sections: int
     next_action: str
 
     def as_dict(self) -> dict[str, Any]:
@@ -66,6 +76,7 @@ class Completion:
             "open_units": self.open_units,
             "uncovered_claims": self.uncovered_claims,
             "unresolved_concerns": self.unresolved_concerns,
+            "undiagnosed_sections": self.undiagnosed_sections,
             "next_action": self.next_action,
         }
 
@@ -121,6 +132,11 @@ class Ledger:
                     caption TEXT,
                     manifest_path TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    section_id TEXT,
+                    section_title TEXT,
+                    tex_file TEXT,
+                    line_start INTEGER,
+                    line_end INTEGER,
                     UNIQUE(run_id, kind, source_document, page, ordinal)
                 );
 
@@ -165,6 +181,17 @@ class Ledger:
                     event TEXT NOT NULL,
                     details TEXT NOT NULL,
                     created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS diagnoses (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    section_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(run_id, kind, subject_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS concerns_run_status ON concerns(run_id, status);
@@ -249,8 +276,9 @@ class Ledger:
                 """
                 INSERT INTO units(
                     id, run_id, kind, locator, source_document, page, ordinal,
-                    content_path, image_path, caption, manifest_path, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    content_path, image_path, caption, manifest_path, status,
+                    section_id, section_title, tex_file, line_start, line_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
                 (
@@ -265,6 +293,11 @@ class Ledger:
                     record.get("image_path"),
                     record.get("caption"),
                     record["manifest_path"],
+                    record.get("section_id"),
+                    record.get("section_title"),
+                    record.get("tex_file"),
+                    record.get("line_start"),
+                    record.get("line_end"),
                 ),
             )
             self.event(db, record["run_id"], "unit", record["id"], "registered")
@@ -557,6 +590,123 @@ class Ledger:
                 {"canonical_id": canonical_id, "reason": reason},
             )
 
+    # -- diagnosis --------------------------------------------------------
+
+    def _insert_diagnosis(
+        self,
+        db: sqlite3.Connection,
+        run_id: str,
+        kind: str,
+        subject_id: str,
+        section_id: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        db.execute(
+            "INSERT INTO diagnoses(id, run_id, kind, subject_id, section_id, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                stable_id("dgn", run_id, kind, subject_id),
+                run_id,
+                kind,
+                subject_id,
+                section_id,
+                json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                time.time(),
+            ),
+        )
+
+    def record_section_diagnosis(
+        self, run_id: str, section_id: str, result: dict[str, Any]
+    ) -> None:
+        """Atomically replace one section block's outline diagnosis.
+
+        Rows: one ``item`` per unit, ``pair`` per adjacent pair, ``sentence``
+        per (unit, ordinal), ``concern`` per final concern, then the
+        ``section_done`` marker that resume and completion count.
+        """
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM diagnoses WHERE run_id = ? AND section_id = ?", (run_id, section_id)
+            )
+            for item in result["items"]:
+                self._insert_diagnosis(db, run_id, "item", item["unit_id"], section_id, item)
+            for pair in result["pairs"]:
+                subject = f"{pair['from_id']}>{pair['to_id']}"
+                self._insert_diagnosis(db, run_id, "pair", subject, section_id, pair)
+            for sentence in result["sentences"]:
+                subject = f"{sentence['unit_id']}#{sentence['sentence_ordinal']}"
+                self._insert_diagnosis(db, run_id, "sentence", subject, section_id, sentence)
+            for concern in result["concerns"]:
+                self._insert_diagnosis(
+                    db, run_id, "concern", concern["concern_id"], section_id, concern
+                )
+            self._insert_diagnosis(db, run_id, "section_done", section_id, section_id, {})
+            self.event(
+                db,
+                run_id,
+                "section",
+                section_id,
+                "section_diagnosed",
+                {
+                    "items": len(result["items"]),
+                    "pairs": len(result["pairs"]),
+                    "sentences": len(result["sentences"]),
+                    "concerns": len(result["concerns"]),
+                },
+            )
+
+    def record_structure_diagnosis(self, run_id: str, result: dict[str, Any]) -> None:
+        """Atomically replace the run's section-level structure diagnosis."""
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM diagnoses WHERE run_id = ? AND kind IN (?, ?, ?)",
+                (run_id, *STRUCTURE_DIAGNOSIS_KINDS),
+            )
+            for section in result["sections"]:
+                self._insert_diagnosis(db, run_id, "section", section["section_id"], None, section)
+            for issue in result["issues"]:
+                self._insert_diagnosis(db, run_id, "issue", issue["issue_id"], None, issue)
+            self._insert_diagnosis(db, run_id, "structure_done", run_id, None, {})
+            self.event(
+                db,
+                run_id,
+                "run",
+                run_id,
+                "structure_diagnosed",
+                {"sections": len(result["sections"]), "issues": len(result["issues"])},
+            )
+
+    def diagnoses(self, run_id: str, kind: str) -> list[dict[str, Any]]:
+        """Diagnosis payloads of one kind, each with its subject and section."""
+        return [
+            {
+                **json.loads(row["payload"]),
+                "_subject_id": row["subject_id"],
+                "_section_id": row["section_id"],
+            }
+            for row in self.rows(
+                "SELECT subject_id, section_id, payload FROM diagnoses "
+                "WHERE run_id = ? AND kind = ? ORDER BY created_at, subject_id",
+                (run_id, kind),
+            )
+        ]
+
+    def diagnosed_sections(self, run_id: str) -> set[str]:
+        return {
+            row["subject_id"]
+            for row in self.rows(
+                "SELECT subject_id FROM diagnoses WHERE run_id = ? AND kind = 'section_done'",
+                (run_id,),
+            )
+        }
+
+    def structure_diagnosed(self, run_id: str) -> bool:
+        return bool(
+            self.rows(
+                "SELECT 1 FROM diagnoses WHERE run_id = ? AND kind = 'structure_done'", (run_id,)
+            )
+        )
+
     # -- queries ----------------------------------------------------------
 
     def rows(self, query: str, parameters: Iterable[Any] = ()) -> list[dict[str, Any]]:
@@ -655,6 +805,35 @@ class Ledger:
                 "SELECT COUNT(*) FROM concerns WHERE run_id = ? AND status NOT IN (?, ?, ?, ?)",
                 (run_id, *sorted(TERMINAL_CONCERN_STATES)),
             ).fetchone()[0]
+            # Section blocks exist only for tex packages; PDF units carry no
+            # section_id, so a PDF run has zero blocks and nothing to diagnose.
+            blocks = db.execute(
+                "SELECT COUNT(DISTINCT section_id) FROM units "
+                "WHERE run_id = ? AND section_id IS NOT NULL",
+                (run_id,),
+            ).fetchone()[0]
+            undiagnosed = db.execute(
+                """
+                SELECT COUNT(DISTINCT u.section_id) FROM units u
+                WHERE u.run_id = ? AND u.section_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM diagnoses d
+                    WHERE d.run_id = u.run_id AND d.kind = 'section_done'
+                      AND d.subject_id = u.section_id
+                  )
+                """,
+                (run_id,),
+            ).fetchone()[0]
+            structure_done = db.execute(
+                "SELECT COUNT(*) FROM diagnoses WHERE run_id = ? AND kind = 'structure_done'",
+                (run_id,),
+            ).fetchone()[0]
+        if blocks and not structure_done:
+            undiagnosed += 1
+        revision_plan = Path(run["output_path"]) / REVISION_PLAN_NAME
+        revision_plan_exists = not blocks or (
+            revision_plan.is_file() and revision_plan.stat().st_size > 0
+        )
         if open_units:
             next_action = "resume divergence for pending or failed units"
         elif uncovered:
@@ -663,6 +842,8 @@ class Ledger:
             )
         elif unresolved:
             next_action = "resume evidence-based concern adjudication"
+        elif undiagnosed and RUN_STAGES.index(run["stage"]) >= RUN_STAGES.index("resolved"):
+            next_action = "resume structural diagnosis"
         elif run["stage"] != "complete":
             next_action = f"resume pipeline stage {run['stage']}"
         else:
@@ -673,13 +854,16 @@ class Ledger:
                 and open_units == 0
                 and uncovered == 0
                 and unresolved == 0
+                and undiagnosed == 0
                 and final_review_exists
+                and revision_plan_exists
             ),
             run_id=run_id,
             stage=run["stage"],
             open_units=open_units,
             uncovered_claims=uncovered,
             unresolved_concerns=unresolved,
+            undiagnosed_sections=undiagnosed,
             next_action=next_action,
         )
 
@@ -687,7 +871,12 @@ class Ledger:
         if not final_review_path.is_file() or final_review_path.stat().st_size == 0:
             raise LedgerError("final review file is missing or empty")
         before = self.completion(run_id)
-        if before.open_units or before.uncovered_claims or before.unresolved_concerns:
+        if (
+            before.open_units
+            or before.uncovered_claims
+            or before.unresolved_concerns
+            or before.undiagnosed_sections
+        ):
             raise LedgerError(json.dumps(before.as_dict(), sort_keys=True))
         with self.connect() as db:
             db.execute(

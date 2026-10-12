@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "argus-reviewer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Provider-agnostic, ledger-audited one-shot paper review harness with isolation by construction and recall instrumentation."
 readme = "README.md"
 requires-python = ">=3.12"

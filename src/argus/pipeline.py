@@ -1,4 +1,4 @@
-"""Stage orchestrator: extract → diverge → resolve → audit → compose.
+"""Stage orchestrator: extract → diverge → resolve → audit → diagnose → compose.
 
 Isolation model: divergence workers are gateway calls whose payload is
 exactly one unit's text (+ optional cropped image). With API adapters
@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import concurrent.futures
 import contextlib
+import dataclasses
 import datetime as dt
 import fcntl
 import json
@@ -26,28 +27,35 @@ from typing import Any
 from urllib.parse import urlparse
 
 from argus.core import ArgusError, sha256_file, stable_id
+from argus.evalx import load_issue_file
 from argus.extract import InputContract, Package, extract_package, validate_package
 from argus.gateway import Gateway, LLMAdapter, ModelSpec, build_adapter
 from argus.ledger import RUN_STAGES, TERMINAL_CONCERN_STATES, Completion, Ledger
 from argus.manifest import build_manifest, verify_manifest, write_manifest
 from argus.prompts import load_prompt
+from argus.revision import write_revision_plan
 from argus.schemas import (
     audit_schema,
     composition_schema,
     divergence_schema,
+    outline_schema,
     resolution_schema,
+    structure_schema,
 )
 from argus.segment import split_sentences
+from argus.tex import catalog_cell_ids, render_catalog
 from argus.validate import (
     validate_audit_partition,
     validate_composition_ids,
     validate_divergence,
+    validate_outline,
     validate_resolutions,
+    validate_structure,
 )
 
-ARGUS_VERSION = "0.1.0"
+ARGUS_VERSION = "0.2.0"
 
-STAGE_NAMES = ("diverge", "resolve", "audit", "compose")
+STAGE_NAMES = ("diverge", "resolve", "audit", "diagnose", "compose")
 
 # Worker ceilings by adapter cost profile: a CLI provider spawns a whole
 # agent process per call, an API provider is a single HTTP request.
@@ -86,9 +94,11 @@ class PipelineConfig:
         contract: Input contract; recorded in the run manifest.
         policy: Domain policy prompt stem (e.g. ``policy-icml``).
         state_root: Directory for the active-run pointer and lock.
-        max_workers: Divergence/resolution parallelism; None picks a count
-            per stage from pending work, CPU budget, and provider cost.
+        max_workers: Divergence/resolution/diagnosis parallelism; None picks
+            a count per stage from pending work, CPU budget, and provider cost.
         batch_size: Concerns per resolver call.
+        preserve_wording: Diagnosis reports only factual errors in sentences
+            (a coauthor's wording is final).
     """
 
     def __init__(
@@ -102,6 +112,7 @@ class PipelineConfig:
         max_workers: int | None = None,
         batch_size: int = 32,
         adapter_factory: Callable[[str], LLMAdapter] = build_adapter,
+        preserve_wording: bool = False,
     ):
         missing = [stage for stage in STAGE_NAMES if stage not in stage_models]
         if missing:
@@ -115,6 +126,7 @@ class PipelineConfig:
         self.max_workers = None if max_workers is None else max(1, max_workers)
         self.batch_size = max(1, batch_size)
         self.adapter_factory = adapter_factory
+        self.preserve_wording = preserve_wording
 
     def gateway(self, stage: str, log_dir: str) -> tuple[Gateway, ModelSpec]:
         spec = self.stage_models[stage]
@@ -243,22 +255,20 @@ def load_research_notes(path: Path) -> dict[str, Any] | None:
 
 def prepare(config: PipelineConfig) -> tuple[str, Package, Ledger]:
     package = validate_package(config.package_root, config.contract)
+    contract = dataclasses.replace(config.contract, source=package.source)
     config.output_root.mkdir(parents=True, exist_ok=True)
-    package_hashes = {
-        "main.pdf": sha256_file(package.main_pdf),
-        package.appendix.name: sha256_file(package.appendix),
-        "reference-notes.md": sha256_file(package.reference_notes),
-    }
+    package_hashes = {name: sha256_file(path) for name, path in package.files.items()}
     run_id = stable_id("run", *sorted(package_hashes.values()), config.output_root)
     _reject_parallel_active_run(config.state_root, run_id)
     manifest = build_manifest(
         run_id,
         package,
         package_hashes,
-        config.contract,
+        contract,
         config.stage_models,
         config.policy,
         ARGUS_VERSION,
+        {"preserve_wording": config.preserve_wording},
     )
     verify_manifest(config.output_root, manifest)
     write_manifest(config.output_root, manifest)
@@ -268,7 +278,7 @@ def prepare(config: PipelineConfig) -> tuple[str, Package, Ledger]:
     _write_active_pointer(config.state_root, run_id, ledger_path, config.output_root, False)
     run = ledger.run(run_id)
     if RUN_STAGES.index(run["stage"]) <= RUN_STAGES.index("created"):
-        extracted = extract_package(package, run_id, config.output_root, config.contract)
+        extracted = extract_package(package, run_id, config.output_root, contract)
         if not extracted["units"]:
             raise ArgusError("input package produced no review units")
         for unit in extracted["units"]:
@@ -292,6 +302,12 @@ _DIVERGENCE_ROLES = {
         "Treat evidence absent from this paragraph as absent for divergence. If a sentence relies "
         "on a Figure or Table you cannot see, ask whether that asset supports the claimed strength."
     ),
+    "source": (
+        "You are a deliberately narrow {kind} critic. You can see only the LaTeX source of the "
+        "{kind} below and its caption; there is no rendered image. Inspect headers, labels, units, "
+        "baselines, uncertainty, footnotes, and whether the values in the source support every "
+        "caption claim."
+    ),
 }
 
 
@@ -303,7 +319,10 @@ def diverge_unit(unit: dict[str, Any], gateway: Gateway, spec: ModelSpec, ledger
     if not sentences:
         ledger.set_unit_status(unit["id"], "failed")
         raise ArgusError(f"unit {unit['id']} contains no sentences")
-    role_key = "visual" if unit["kind"] in {"figure", "table"} else "paragraph"
+    role_key = "paragraph"
+    if unit["kind"] in {"figure", "table"}:
+        # A tex table (or a figure without \includegraphics) has no image.
+        role_key = "visual" if unit.get("image_path") else "source"
     role = _DIVERGENCE_ROLES[role_key].format(kind=unit["kind"])
     numbered = "\n".join(f"S{index}: {sentence}" for index, sentence in enumerate(sentences, 1))
     prompt = load_prompt("divergence").render(
@@ -490,6 +509,253 @@ def audit_final_concerns(
     export_ledger(ledger, run_id, config.output_root)
 
 
+# -- diagnose ---------------------------------------------------------------
+
+
+def _read_sections(output_root: Path) -> list[dict[str, Any]]:
+    """Section blocks written at extraction; absent (PDF) means no blocks."""
+    path = output_root / "sections.json"
+    if not path.is_file():
+        return []
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, list):
+        raise ArgusError(f"sections must contain an array: {path}")
+    return value
+
+
+def _unit_sentences(unit: dict[str, Any]) -> list[str]:
+    # The same segmentation as divergence, so ordinals match the claims table.
+    content = Path(unit["content_path"]).read_text(encoding="utf-8").strip()
+    return list(split_sentences(content).sentences)
+
+
+def diagnose(run_id: str, config: PipelineConfig, ledger: Ledger) -> None:
+    """Structural diagnosis of a tex manuscript: per-section outline, then structure.
+
+    Step 1 runs one outline call per unfinished section block in parallel;
+    step 2 runs one structure call over the whole outline. A run without
+    section blocks (a PDF package) is recorded and passes with no calls.
+    """
+    ledger.set_stage(run_id, "diagnosing")
+    sections = _read_sections(config.output_root)
+    if not sections:
+        ledger.note(run_id, "diagnosis_skipped", {"reason": "package has no section blocks"})
+        ledger.set_stage(run_id, "diagnosed")
+        return
+    gateway, spec = config.gateway("diagnose", "diagnosis")
+    units = {unit["id"]: unit for unit in ledger.list_units(run_id)}
+    order = [unit_id for section in sections for unit_id in section["unit_ids"]]
+    short = {unit_id: f"P{index}" for index, unit_id in enumerate(order, 1)}
+    section_ids = [section["section_id"] for section in sections]
+    tables = json.loads((config.output_root / "table-cells.json").read_text(encoding="utf-8"))[
+        "tables"
+    ]
+    cell_ids = catalog_cell_ids(tables)
+    catalog = render_catalog(tables)
+    final_concerns = [
+        {**concern, "short_id": short.get(concern["unit_id"])}
+        for concern in ledger.rows(
+            "SELECT id AS concern_id, unit_id, locator, category, question, evidence, materiality "
+            "FROM concerns WHERE run_id = ? AND status = 'promoted_final' "
+            "ORDER BY CASE materiality WHEN 'major' THEN 0 ELSE 1 END, created_at, id",
+            (run_id,),
+        )
+    ]
+    main_order = json.dumps(
+        [
+            {
+                "section_id": section["section_id"],
+                "title": section["title"],
+                "unit_ids": section["unit_ids"],
+            }
+            for section in sections
+        ],
+        ensure_ascii=False,
+    )
+    move_targets = set(order) | set(section_ids)
+    wording_mode = "preserve wording" if config.preserve_wording else "normal"
+    template = load_prompt("outline")
+
+    def context(unit_id: str | None) -> dict[str, Any] | None:
+        if unit_id is None:
+            return None
+        unit = units[unit_id]
+        return {
+            "unit_id": unit_id,
+            "short_id": short[unit_id],
+            "locator": unit["locator"],
+            "text": Path(unit["content_path"]).read_text(encoding="utf-8").strip(),
+        }
+
+    def outline(index: int) -> None:
+        section = sections[index]
+        unit_ids = section["unit_ids"]
+        sentences: dict[tuple[str, int], str] = {}
+        payload = []
+        for unit_id in unit_ids:
+            numbered = _unit_sentences(units[unit_id])
+            sentences.update({(unit_id, ordinal): text for ordinal, text in enumerate(numbered, 1)})
+            payload.append(
+                {
+                    "unit_id": unit_id,
+                    "short_id": short[unit_id],
+                    "kind": units[unit_id]["kind"],
+                    "locator": units[unit_id]["locator"],
+                    "sentences": [
+                        {"ordinal": ordinal, "text": text}
+                        for ordinal, text in enumerate(numbered, 1)
+                    ],
+                }
+            )
+        # Pairs join consecutive paragraphs only: a float does not take up a
+        # paragraph's question, so floats in between are skipped.
+        paragraphs = [unit_id for unit_id in unit_ids if units[unit_id]["kind"] == "paragraph"]
+        pairs = list(zip(paragraphs, paragraphs[1:], strict=False))
+        members = set(unit_ids)
+        concerns = [concern for concern in final_concerns if concern["unit_id"] in members]
+        concern_ids = {concern["concern_id"] for concern in concerns}
+        prompt = template.render(
+            wording_mode=wording_mode,
+            unit_count=len(unit_ids),
+            pair_count=len(pairs),
+            sentence_count=len(sentences),
+            concern_count=len(concerns),
+            section=json.dumps(
+                {
+                    "section_id": section["section_id"],
+                    "title": section["title"],
+                    "parent_title": section["parent_title"],
+                },
+                ensure_ascii=False,
+            ),
+            main_order=main_order,
+            context=json.dumps(
+                {
+                    "before": context(sections[index - 1]["unit_ids"][-1] if index else None),
+                    "after": context(
+                        sections[index + 1]["unit_ids"][0] if index + 1 < len(sections) else None
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            pairs=json.dumps([{"from_id": a, "to_id": b} for a, b in pairs]),
+            concerns=json.dumps(concerns, ensure_ascii=False),
+            catalog=catalog,
+            units=json.dumps(payload, ensure_ascii=False),
+        )
+        schema = outline_schema(
+            unit_ids, len(pairs), len(sentences), concern_ids, config.preserve_wording
+        )
+        result = gateway.complete_json(f"outline-{section['section_id']}", prompt, schema, spec)
+        validate_outline(
+            result,
+            unit_ids,
+            pairs,
+            sentences,
+            concern_ids,
+            cell_ids,
+            move_targets,
+            config.preserve_wording,
+        )
+        ledger.record_section_diagnosis(run_id, section["section_id"], result)
+
+    done = ledger.diagnosed_sections(run_id)
+    pending = [index for index, section in enumerate(sections) if section["section_id"] not in done]
+    workers = effective_workers(spec.provider, len(pending), config.max_workers)
+    ledger.note(
+        run_id,
+        "workers_selected",
+        {
+            "stage": "diagnose",
+            "workers": workers,
+            "pending_sections": len(pending),
+            "requested": config.max_workers,
+        },
+    )
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def execute(index: int) -> None:
+        try:
+            outline(index)
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for future in [pool.submit(execute, index) for index in pending]:
+            future.result()
+    if errors:
+        export_ledger(ledger, run_id, config.output_root)
+        raise ArgusError(f"{len(errors)} outline workers failed; first: {errors[0]}")
+    if not ledger.structure_diagnosed(run_id):
+        diagnose_structure(run_id, config, ledger, sections, short, final_concerns)
+    completion = ledger.completion(run_id)
+    if completion.undiagnosed_sections:
+        raise ArgusError(json.dumps(completion.as_dict(), sort_keys=True))
+    ledger.set_stage(run_id, "diagnosed")
+    export_ledger(ledger, run_id, config.output_root)
+
+
+def diagnose_structure(
+    run_id: str,
+    config: PipelineConfig,
+    ledger: Ledger,
+    sections: list[dict[str, Any]],
+    short: dict[str, str],
+    final_concerns: list[dict[str, Any]],
+) -> None:
+    gateway, spec = config.gateway("diagnose", "diagnosis")
+    units = {unit["id"]: unit for unit in ledger.list_units(run_id)}
+    items = {row["unit_id"]: row for row in ledger.diagnoses(run_id, "item")}
+    issues_path = Path(config.package_root) / "issues.json"
+    issues = load_issue_file(issues_path) if issues_path.is_file() else []
+    section_ids = [section["section_id"] for section in sections]
+    issue_ids = {issue["id"] for issue in issues}
+    outline = [
+        {
+            "section_id": section["section_id"],
+            "title": section["title"],
+            "parent_title": section["parent_title"],
+            "units": [
+                {
+                    "unit_id": unit_id,
+                    "short_id": short[unit_id],
+                    "locator": units[unit_id]["locator"],
+                    "learns": items[unit_id]["learns"],
+                    "action": items[unit_id]["action"],
+                    "move_before": items[unit_id]["move_before"],
+                }
+                for unit_id in section["unit_ids"]
+            ],
+        }
+        for section in sections
+    ]
+    body = [
+        {
+            "unit_id": unit_id,
+            "short_id": short[unit_id],
+            "section_id": section["section_id"],
+            "text": Path(units[unit_id]["content_path"]).read_text(encoding="utf-8").strip(),
+        }
+        for section in sections
+        for unit_id in section["unit_ids"]
+    ]
+    prompt = load_prompt("structure").render(
+        section_count=len(sections),
+        issue_count=len(issues),
+        outline=json.dumps(outline, ensure_ascii=False),
+        concerns=json.dumps(final_concerns, ensure_ascii=False),
+        issues=json.dumps(issues, ensure_ascii=False),
+        body=json.dumps(body, ensure_ascii=False),
+    )
+    result = gateway.complete_json(
+        "structure", prompt, structure_schema(section_ids, issue_ids), spec
+    )
+    validate_structure(result, section_ids, issue_ids, set(short))
+    ledger.record_structure_diagnosis(run_id, result)
+
+
 # -- compose ----------------------------------------------------------------
 
 
@@ -601,6 +867,7 @@ def compose(run_id: str, config: PipelineConfig, ledger: Ledger) -> Path:
     )
     review_path = config.output_root / "review.md"
     review_path.write_text(_render_review(result, final_concerns), encoding="utf-8")
+    write_revision_plan(ledger, run_id, config.output_root, result["concern_order"])
     completion = ledger.finalize(run_id, review_path)
     if not completion.complete:
         raise ArgusError(json.dumps(completion.as_dict(), sort_keys=True))
@@ -625,6 +892,9 @@ def export_ledger(ledger: Ledger, run_id: str, output_root: Path) -> None:
         "units": ledger.list_units(run_id),
         "claims": ledger.list_claims(run_id),
         "concerns": ledger.list_concerns(run_id),
+        "diagnoses": ledger.rows(
+            "SELECT * FROM diagnoses WHERE run_id = ? ORDER BY kind, subject_id", (run_id,)
+        ),
         "events": ledger.rows("SELECT * FROM events WHERE run_id = ? ORDER BY sequence", (run_id,)),
     }
     (output_root / "ledger.json").write_text(
@@ -660,6 +930,8 @@ def run_pipeline(config: PipelineConfig, stop_after: str | None = None) -> Compl
         if stop_after == "resolved":
             export_ledger(ledger, run_id, config.output_root)
             return ledger.completion(run_id)
+        if RUN_STAGES.index(ledger.run(run_id)["stage"]) <= RUN_STAGES.index("diagnosing"):
+            diagnose(run_id, config, ledger)
         if RUN_STAGES.index(ledger.run(run_id)["stage"]) <= RUN_STAGES.index("composing"):
             compose(run_id, config, ledger)
         return ledger.completion(run_id)

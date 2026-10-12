@@ -47,6 +47,14 @@ Then just ask:
 A package is a directory with `main.pdf` (4 pages by default; any length via
 `--pages`), `appendix.pdf` or `appendix.md`, and `reference-notes.md`.
 
+A package can also be a LaTeX source tree: a root tex file (`main.tex`, or the
+name given with `--main-tex`), `reference-notes.md`, and optionally
+`issues.json` (a JSON array of `{id, text}` issues, the same format as
+`argus recall-eval`). When the root tex file exists, argus reviews the source
+instead of a PDF and adds a structural diagnosis that ends in a revision plan
+(see [Revising a LaTeX manuscript](#revising-a-latex-manuscript)).
+`--pages` and `--merge-chars` do not apply to tex packages.
+
 The session picks up four things: an `argus` MCP server (live ledger status,
 attrition, concern claiming), a Stop hook that blocks the session while a
 review is incomplete, a skill that teaches the agent the workflow, and
@@ -73,7 +81,8 @@ uv run argus recall-eval public-issues.json -m anthropic:claude-sonnet-5
 ```
 
 Models are named `PROVIDER:MODEL` and can differ per stage
-(`--diverge-model`, `--resolve-model`, `--audit-model`, `--compose-model`).
+(`--diverge-model`, `--resolve-model`, `--audit-model`, `--diagnose-model`,
+`--compose-model`).
 Interrupted runs resume with the exact same command; finished work is never
 re-billed.
 
@@ -99,7 +108,8 @@ cannot be confused later.
                                            │
      ┌─────────────────────────────────────▼──────────────────────────────────┐
      │                     Pipeline Orchestrator (stage machine)              │
-     │    extract ─► diverge ─► resolve ─► audit ─► compose ─► complete       │
+     │    extract ─► diverge ─► resolve ─► audit ─► diagnose ─►               │
+     │    compose ─► complete                                                 │
      │    · no backward stages  · every stage resumable                       │
      │    · run-manifest freeze: config/prompt/policy hashes verified on resume│
      └──────┬──────────────────────┬────────────────────────┬─────────────────┘
@@ -150,11 +160,53 @@ labeling each issue `surfaced_final`, `surfaced_but_attrited`, or `missed`.
 `surfaced_but_attrited` is the precision/recall trade made visible: those are
 exactly the concerns the domain policy filtered away.
 
+## Revising a LaTeX manuscript
+
+For a tex package, extraction expands every `\input`/`\include` of the root
+file, strips comments, and keeps a line map, so each review unit is one
+paragraph, `figure`, or `table` environment of the main body (before
+`\appendix`) with a `file:Lstart-Lend (section)` locator. Section headings
+and the `abstract` environment start section blocks. Every `table`
+environment, in the main body and the appendix, is parsed into a table cell
+catalog (`table-cells.json`) with cell IDs such as `tab:main:r2c3`.
+
+After the review concerns are final, the `diagnose` stage runs two steps:
+
+1. One outline call per section block, in parallel. For each unit it records
+   what the reader newly learns, a deletion test, and an action (keep, fix,
+   delete, move). For each adjacent pair it records whether the second unit
+   takes up the first, and whether object, point, or criterion shift. For
+   each sentence the model labels whether it carries a causal link or a
+   number and quotes the words that do; code checks that the quote is a
+   verbatim substring of the sentence. A claim ledger ties each such sentence
+   to catalog cells, or to a narrower claim that the cells do support. Each
+   final concern gets a fix direction.
+2. One structure call over the whole outline. For each section it records the
+   question the reader holds on entry, the answer on exit, and whether the
+   section takes up the previous one. It maps each external issue from
+   `issues.json` to main-body units.
+
+Both outputs pass a JSON Schema and exact-set validators, so every unit,
+pair, sentence, concern, section, and issue is answered exactly once. A
+finished section block is recorded atomically and is never re-run on resume.
+`--preserve-wording` limits sentence notes to factual errors (for text that a
+coauthor has finalized); the choice is frozen in the run manifest.
+
+Compose then writes `revision-plan.md` and `revision-plan.json` from ledger
+rows only: decisions that need a new experiment or computation (flagged for
+the owner, never scheduled), one table per section with
+`ID | Location | Reader learns | Flags | Action | Direction`, the claim
+ledger, and sentence notes. Argus never edits the manuscript; only rows the
+owner approves are applied, by a person or an agent. A PDF package has no
+section blocks, so the stage records that and passes with no model call.
+
 ## What a run leaves behind
 
 | Artifact | What it answers |
 |---|---|
 | `review.md` / `review.json` | The final review, human- and machine-readable |
+| `revision-plan.md` / `revision-plan.json` | Tex packages only: the structural diagnosis as an approvable revision plan |
+| `table-cells.json` / `sections.json` | Tex packages only: the table cell catalog and the section blocks |
 | `ledger.sqlite3` / `ledger.json` | Every unit, claim, concern, and event, queryable |
 | `attrition.json` | Where concerns died, by stage, status, and reason |
 | `run-manifest.json` | Exactly which prompts, models, policy, segmenter, and inputs ran |
